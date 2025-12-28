@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	_ "net/http/pprof"
 	"os"
@@ -12,24 +14,48 @@ import (
 	"time"
 )
 
-func main() {
+const (
+	TinyBuffer     = 16       // 16 B
+	SmallBuffer    = 256      // 256 B
+	SmallMedBuffer = 512      // 512 B
+	MedBuffer      = 1 << 10  // 1 KiB  (1024 B)
+	MedBigBuffer   = 2 << 10  // 2 KiB
+	BigBuffer      = 8 << 10  // 8 KiB
+	BigBigBuffer   = 16 << 10 // 16 KiB
+)
+
+func initPprof() {
 	f, _ := os.Create("cpu.prof")
 	pprof.StartCPUProfile(f)
 	defer pprof.StopCPUProfile()
 
 	f2, _ := os.Create("mem.prof")
 	pprof.WriteHeapProfile(f2)
+}
 
-	startRoot := time.Now()
-	file, err := os.Open("measurements_1b.txt")
+func openMeasurements(path string) (time.Time, error) {
+	start := time.Now()
+	file, err := os.Open(path)
 	if err != nil {
 		log.Fatal("unable to open measurements, err: ", err)
 	}
 	defer file.Close()
-	durationOpen := time.Since(startRoot)
+	return start, nil
+}
+
+func main() {
+	initPprof()
+
+	startApp, err := openMeasurements("measurements_1b.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	durationOpen := time.Since(startApp)
 
 	entries := make(map[string]*Entry)
-	scanner := bufio.NewScanner(file)
+	b := make([]byte, 0, TinyBuffer)
+	r := bytes.NewReader(b)
+	scanner := bufio.NewReaderSize()
 
 	startScan := time.Now()
 	for scanner.Scan() {
