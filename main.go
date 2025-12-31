@@ -2,26 +2,23 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"io"
 	"log"
 	_ "net/http/pprof"
 	"os"
 	"runtime/pprof"
-	"strconv"
-	"strings"
 	"time"
 )
 
 const (
-	TinyBuffer     = 16       // 16 B
-	SmallBuffer    = 256      // 256 B
-	SmallMedBuffer = 512      // 512 B
-	MedBuffer      = 1 << 10  // 1 KiB  (1024 B)
-	MedBigBuffer   = 2 << 10  // 2 KiB
-	BigBuffer      = 8 << 10  // 8 KiB
-	BigBigBuffer   = 16 << 10 // 16 KiB
+	Buf16B  = 16       // 16 B
+	Buf256B = 256      // 256 B
+	Buf512B = 512      // 512 B
+	Buf1KB  = 1 << 10  // 1 KiB  (1024 B)
+	Buf2KB  = 2 << 10  // 2 KiB
+	Buf8KB  = 8 << 10  // 8 KiB
+	Buf16KB = 16 << 10 // 16 KiB
 )
 
 func initPprof() {
@@ -33,60 +30,51 @@ func initPprof() {
 	pprof.WriteHeapProfile(f2)
 }
 
-func openMeasurements(path string) (time.Time, error) {
+func openMeasurements(path string) (*os.File, time.Time) {
 	start := time.Now()
 	file, err := os.Open(path)
 	if err != nil {
 		log.Fatal("unable to open measurements, err: ", err)
 	}
-	defer file.Close()
-	return start, nil
+	return file, start
 }
 
 func main() {
+	bufSize := Buf2KB
 	initPprof()
 
-	startApp, err := openMeasurements("measurements_1b.txt")
-	if err != nil {
-		log.Fatal(err)
-	}
-	durationOpen := time.Since(startApp)
+	f, startTime := openMeasurements("measurements_100m.txt")
+	defer f.Close()
+	durationOpenFile := time.Since(startTime)
 
-	entries := make(map[string]*Entry)
-	b := make([]byte, 0, TinyBuffer)
-	r := bytes.NewReader(b)
-	scanner := bufio.NewReaderSize()
+	// entries := make(map[string]*Entry)
+	b := make([]byte, bufSize)
+	r := bufio.NewReaderSize(f, bufSize)
 
 	startScan := time.Now()
-	for scanner.Scan() {
-		lineElements := strings.Split(scanner.Text(), ";")
-		cityName := lineElements[0]
-		measurement, err := strconv.ParseFloat(lineElements[1], 64)
+	for {
+		n, err := r.Read(b)
 		if err != nil {
-			log.Panic("unable to parse measurement, err:", err)
+			if err == io.EOF {
+				break
+			}
+			log.Fatal("read failed with: %w", err)
 		}
 
-		if entry, ok := entries[cityName]; ok {
-			entry.housekeep(measurement)
-		} else {
-			entries[cityName] = NewEntry(measurement)
-		}
+		fmt.Println(string(b[:n]))
 	}
+
 	durationScan := time.Since(startScan)
 	startOutput := time.Now()
 
-	for city, entry := range entries {
-		fmt.Printf("%s;%.1f;%.1f;%.1f\n", city, entry.Min, entry.Sum/entry.Count, entry.Max) // min, mean, max
-	}
+	//	for city, entry := range entries {
+	//		fmt.Printf("%s;%.1f;%.1f;%.1f\n", city, entry.Min, entry.Sum/entry.Count, entry.Max) // min, mean, max
+	//	}
 
 	durationOutput := time.Since(startOutput)
-	durationAll := time.Since(startRoot)
+	durationAll := time.Since(startTime)
 
-	fmt.Printf("opening: %v, scan: %v, output: %v, all: %v\n", durationOpen, durationScan, durationOutput, durationAll)
-
-	if err := scanner.Err(); err != nil {
-		log.Fatal(err)
-	}
+	fmt.Printf("opening: %v, scan: %v, output: %v, all: %v\n", durationOpenFile, durationScan, durationOutput, durationAll)
 }
 
 type Entry struct {
