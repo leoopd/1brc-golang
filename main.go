@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strconv"
 	"fmt"
 	"io"
 	"log"
@@ -12,6 +11,7 @@ import (
 )
 
 // max seems to be 1073741824B, ~1GB
+// optimal buffer for now: 1000 << 10
 
 const (
 	Buf2KB  = 2 << 10  // default of bufio
@@ -24,18 +24,15 @@ const (
 	Buf16KB = 16 << 10 // 16 KiB
 )
 
-// optimal buffer for now: 1000 << 10
-
 func main() {
-	bufSize := 25
+	fmt.Println("starting...")
+	bufSize := 1000 << 10
 	initPprof()
 
-	f, startTime := openMeasurements("measurements_3r.txt")
+	f, startTime := openMeasurements("measurements_1b.txt")
 
 	defer f.Close()
 	durationOpenFile := time.Since(startTime)
-
-	entries := make(map[string]*Entry)
 
 	type bfr struct {
 		b   []byte
@@ -46,29 +43,25 @@ func main() {
 	}
 
 	b := bfr{
-		b:   make([]byte, bufSize),
-		f:   f,
-		len: bufSize,
+		b: make([]byte, bufSize),
+		f: f,
 	}
-	// r := bufio.NewReaderSize(f, bufSize)
 
 	startScan := time.Now()
+
+	// let's create this here for now since we otherwise overwrite it on
+	// every new chunk
+	entries := make(map[string]*Station)
 	for {
 		// this gives us a chunk of the file (up to bufSize)
 		// at this point we don't know whether it ends in the middle
 		// of a line or at the end of one (kinda unlikely)
-		n, err := f.Read(b.b)
+		n, err := b.f.Read(b.b)
 		if err != nil {
 			if err == io.EOF {
 				break
 			}
 			log.Fatal("read failed with: %w", err)
-		}
-
-		if n < b.len {
-			// this is our last chunk, which means there might be
-			// bytes remaining in b.b
-			b.lc = true
 		}
 
 		// let's read backwards into the chunk until we find a linebreak
@@ -83,22 +76,42 @@ func main() {
 		// a split line.
 		// Let's prefix our next chunk with it to make it complete.
 
-		// We exlude the last line-break to indicate the end of a chunk. 
+		// We exlude the last line-break to indicate the end of a chunk.
 		chunk := append(b.lo, b.b[:nlo+1]...)
-		fmt.Printf("chunk: %s\n", strconv.Quote(string(chunk)))
+		//	fmt.Printf("chunk created: %s\n", strconv.Quote(string(chunk)))
 		b.lo = append([]byte{}, b.b[nlo+1:n]...)
 
 		// [-- start process
-		// every byte before ';' belongs to the key (station name)
-		// every byte after that represents the reading between '-99.0' and '99.9' 
-		var lineStart int
-		for i, byte := range chunk {
-			if byte == '\n' {
-				line := chunk[lineStart:i]
-				lineStart = i+1
+		// every byte before ';' belongs to station name,
+		// every byte after that belongs to the reading ('-99.0' - '99.9')
 
-			} 
-			// linestart:i == line
+		var lineStart int
+		var semicolon int
+		var rdng reading
+		for i, byte := range chunk {
+			if byte == ';' {
+				// linestart:i contains name
+				semicolon = i
+				rdng = reading{name: string(chunk[lineStart:semicolon])}
+			}
+			if byte == '\n' {
+				// ;:i contains float value
+				lineStart = i + 1
+				rdng.value = processToFloat(chunk[semicolon+1 : i])
+
+				if station, ok := entries[rdng.name]; ok {
+					station.count++
+					station.sum += rdng.value
+					if station.min > rdng.value {
+						station.min = rdng.value
+					}
+					if station.max < rdng.value {
+						station.max = rdng.value
+					}
+				} else {
+					entries[rdng.name] = newStation(rdng)
+				}
+			}
 		}
 		// end process --]
 
@@ -114,20 +127,38 @@ func main() {
 		//			check min/max, add to sum, incr count
 		//		! add to map
 		// 2) gomaxprocs-1 goroutines that process chunks to
-		//    entries and send the entry to a chan
+		//    entries and send the rdng to a chan
 	}
+	fmt.Println(len(entries))
 
 	durationScan := time.Since(startScan)
 	startOutput := time.Now()
-
-	for city, entry := range entries {
-		fmt.Printf("%s;%.1f;%.1f;%.1f\n", city, entry.Min, entry.Sum/entry.Count, entry.Max) // min, mean, max
-	}
 
 	durationOutput := time.Since(startOutput)
 	durationAll := time.Since(startTime)
 
 	fmt.Printf("opening: %v, scan: %v, output: %v, all: %v\n", durationOpenFile, durationScan, durationOutput, durationAll)
+}
+
+type reading struct {
+	name  string
+	value float32
+}
+
+type Station struct {
+	min   float32
+	max   float32
+	sum   float32
+	count int
+}
+
+func newStation(rdng reading) *Station {
+	return &Station{
+		min:   rdng.value,
+		max:   rdng.value,
+		sum:   rdng.value,
+		count: 1,
+	}
 }
 
 func initPprof() {
@@ -148,31 +179,28 @@ func openMeasurements(path string) (*os.File, time.Time) {
 	return file, start
 }
 
-type Entry struct {
-	Min   float64
-	Max   float64
-	Sum   float64
-	Count float64
-}
+func processToFloat(b []byte) float32 {
+	neg := false
+	i := 0
 
-func NewEntry(measurement float64) *Entry {
-	return &Entry{
-		Min:   measurement,
-		Max:   measurement,
-		Sum:   measurement,
-		Count: 1,
-	}
-}
-
-func (e *Entry) housekeep(measurement float64) {
-	e.Count++
-	e.Sum += measurement
-
-	if measurement < e.Min {
-		e.Min = measurement
+	if b[0] == '-' {
+		neg = true
+		i++
 	}
 
-	if measurement > e.Max {
-		e.Max = measurement
+	intPart := b[i] - '0'
+	decimal := b[len(b)-1] - '0'
+	i++
+
+	for ; i < len(b); i++ {
+		if b[i] == '.' {
+			break
+		}
+		intPart += (b[i] - '0') * 10
 	}
+
+	if neg {
+		return -(float32(intPart) + float32(decimal)/10)
+	}
+	return float32(intPart) + float32(decimal)/10
 }
