@@ -81,12 +81,12 @@ func main() {
 		if n < bufSize {
 			// we need to cut off trailing space for our last chunk
 			chunk = chunk[:reserved+n-1]
-			chunkCh <- &chunk
-			close(chunkCh)
+			chunkChan <- chunk
+			close(chunkChan)
 			continue
 		}
 
-		chunkCh <- &chunk
+		chunkChan <- chunk
 		if err == io.EOF {
 			break
 		}
@@ -96,19 +96,16 @@ func main() {
 
 	fmt.Println("waiting for processing...")
 	wg.Wait()
-	close(valCh)
+	close(shardChan)
 	durationProcessing := time.Since(startProcessing)
 
 	fmt.Println("waiting for map...")
-	wgM.Wait()
-	entryMap := <-mapCh
-	fmt.Println(entryMap)
+	wgMap.Wait()
 
 	durationStartMap := time.Since(startMap)
 	durationAll := time.Since(startTime)
 
 	fmt.Printf("opening: %v, scan: %v, processing: %v, map: %v, all: %v\n", durationOpenFile, durationScan, durationProcessing, durationStartMap, durationAll)
-	fmt.Println(len(*entryMap))
 }
 
 func processChunks(wg *sync.WaitGroup, chunks chan []byte, shardCh chan map[string]Station) {
@@ -138,6 +135,7 @@ func processChunks(wg *sync.WaitGroup, chunks chan []byte, shardCh chan map[stri
 					} else if value > station.minVal {
 						station.maxVal = value
 					}
+					shard[name] = station
 				} else {
 					shard[name] = Station{minVal: value, sum: value, maxVal: value, count: 1}
 				}
@@ -146,11 +144,6 @@ func processChunks(wg *sync.WaitGroup, chunks chan []byte, shardCh chan map[stri
 		shardCh <- shard
 	}
 
-}
-
-type reading struct {
-	name  string
-	value float64
 }
 
 type Station struct {
