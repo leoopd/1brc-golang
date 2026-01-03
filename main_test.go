@@ -67,7 +67,7 @@ Paris;8.0
 `
 	input = strings.TrimSpace(input)
 
-	filePath := filepath.Join(tmpDir, "measurements_1b.txt")
+	filePath := filepath.Join(tmpDir, "measurements_100m.txt")
 	if err := os.WriteFile(filePath, []byte(input), 0o644); err != nil {
 		t.Fatalf("failed to write temp file: %v", err)
 	}
