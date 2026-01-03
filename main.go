@@ -24,63 +24,75 @@ func main() {
 	pprof.WriteHeapProfile(f3)
 
 	f, startTime := openMeasurements("measurements_1b.txt")
+
 	defer f.Close()
 	durationOpenFile := time.Since(startTime)
 
-	bufSize := 650000 << 10
-	chunkCh := make(chan *[]byte, 130)
+	startProcessing := time.Now()
+
+	var wg sync.WaitGroup
+	shardChan := make(chan map[string]Station, 5)
+	chunkChan := make(chan []byte, 5)
+
+	for range 20 {
+		wg.Add(1)
+		go processChunks(&wg, chunkChan, shardChan)
+	}
+
+	var wgMap sync.WaitGroup
+	wgMap.Add(1)
+
+	startMap := time.Now()
+	go mergeMaps(&wgMap, shardChan)
+
+	bufSize := 100 << 20 //100MB
 	startScan := time.Now()
 	var leftOver []byte
 	for {
 		reserved := len(leftOver)
-		// make chunk that is big enough to hold next read and leftOver
-		// from previous read
+		// make chunk that is big enough to hold next read
+		// and leftOver from previous read
 		chunk := make([]byte, 0, reserved+bufSize)
 		chunk = append(chunk, leftOver...)
 		chunk = chunk[:cap(chunk)]
 
 		n, err := f.Read(chunk[reserved:])
-		var nlo int
+		var idxLinebreak int
+
 		// if chunk doesn't end in 'n'
 		lastNewElem := reserved + n - 1
 		if chunk[lastNewElem] != '\n' {
+			// walk bakwards until we find the first linebreak
 			for i := lastNewElem; i >= 0; i-- {
 				if chunk[i] == '\n' {
-					nlo = i
+					idxLinebreak = i
 					break
 				}
 			}
-			leftOver = chunk[nlo+1 : lastNewElem]
-			chunk = chunk[:nlo+1]
+			leftOver = chunk[idxLinebreak+1 : lastNewElem+1]
+			chunk = chunk[:idxLinebreak+1]
 		}
 
-		// chunk: [leftOver, new data incl. next leftOver]
-
-		if n < bufSize || err == io.EOF {
+		// chunk: [
+		// :reserved > leftovers from previours
+		// reserved+1:reserved+n-1 > new data read
+		// reserved+n-1:len(chunk) > potentially old unusable data
+		// ]
+		if n < bufSize {
 			// we need to cut off trailing space for our last chunk
-			chunk = chunk[:reserved+n]
+			chunk = chunk[:reserved+n-1]
 			chunkCh <- &chunk
 			close(chunkCh)
+			continue
+		}
+
+		chunkCh <- &chunk
+		if err == io.EOF {
 			break
 		}
-		chunkCh <- &chunk
 	}
 
 	durationScan := time.Since(startScan)
-	startProcessing := time.Now()
-
-	var wg sync.WaitGroup
-	valCh := make(chan *[]reading, 130)
-	for range 20 {
-		wg.Add(1)
-		go processChunks(&wg, chunkCh, valCh)
-	}
-
-	startMap := time.Now()
-	var wgM sync.WaitGroup
-	mapCh := make(chan *map[string]station, 13000)
-	wgM.Add(1)
-	go writeToMap(&wgM, mapCh, valCh)
 
 	fmt.Println("waiting for processing...")
 	wg.Wait()
@@ -99,34 +111,41 @@ func main() {
 	fmt.Println(len(*entryMap))
 }
 
-func processChunks(wg *sync.WaitGroup, chunks chan *[]byte, readingChan chan *[]reading) {
+func processChunks(wg *sync.WaitGroup, chunks chan []byte, shardCh chan map[string]Station) {
 	defer wg.Done()
-	for chunkPtr := range chunks {
+	for chunk := range chunks {
+		var (
+			lineStart int
+			semicolon int
+		)
+		shard := make(map[string]Station)
 
-		var lineStart int
-		var semicolon int
-		var name string
-		var readings []reading
-		for i, byte := range *chunkPtr {
-			if byte == ';' {
+		for i, elem := range chunk {
+			if elem == ';' {
 				// linestart:i contains name
 				semicolon = i
-				name = string((*chunkPtr)[lineStart:i])
 			}
-
 			// we found our float value, chunk[semicolon:i]
-			if byte == '\n' {
-				currentValue := processToFloat((*chunkPtr)[semicolon+1 : i])
-				// move linestart to next byte
+			if elem == '\n' {
 				lineStart = i + 1
-
-				e := reading{name: name, value: currentValue}
-				readings = append(readings, e)
+				name := string(chunk[lineStart:i])
+				value := processToFloat(chunk[semicolon+1 : i])
+				if station, ok := shard[name]; ok {
+					station.count++
+					station.sum += value
+					if value < station.minVal {
+						station.minVal = value
+					} else if value > station.minVal {
+						station.maxVal = value
+					}
+				} else {
+					shard[name] = Station{minVal: value, sum: value, maxVal: value, count: 1}
+				}
 			}
 		}
-		// end process --]
-		readingChan <- &readings
+		shardCh <- shard
 	}
+
 }
 
 type reading struct {
@@ -134,34 +153,34 @@ type reading struct {
 	value float64
 }
 
-type station struct {
-	min   float64
-	sum   float64
-	max   float64
-	count float64
+type Station struct {
+	minVal float64
+	sum    float64
+	maxVal float64
+	count  float64
 }
 
-func writeToMap(wg *sync.WaitGroup, mapCh chan *map[string]station, vCh chan *[]reading) {
+func mergeMaps(wg *sync.WaitGroup, shardChan chan map[string]Station) {
 	defer wg.Done()
-	entries := make(map[string]station)
-	for readings := range vCh {
-		for _, reading := range *readings {
-			v := reading.value
-			if entry, ok := entries[reading.name]; ok {
-				entry.count++
-				entry.sum += v
-				if v < entry.min {
-					entry.min = v
-				} else if v > entry.max {
-					entry.max = v
+	globalStations := make(map[string]Station)
+
+	for shard := range shardChan {
+		for name, shardStation := range shard {
+			if globalStation, ok := globalStations[name]; ok {
+				globalStation.count++
+				globalStation.sum += shardStation.sum
+				if shardStation.minVal < globalStation.minVal {
+					globalStation.minVal = shardStation.minVal
+				} else if shardStation.maxVal > globalStation.minVal {
+					globalStation.maxVal = shardStation.maxVal
 				}
-				entries[reading.name] = entry
+				globalStations[name] = globalStation
 			} else {
-				entries[reading.name] = station{min: v, sum: v, max: v, count: 1}
+				globalStations[name] = shardStation
 			}
 		}
 	}
-	mapCh <- &entries
+	fmt.Println(globalStations)
 }
 
 func openMeasurements(path string) (*os.File, time.Time) {
