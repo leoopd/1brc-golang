@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
 	_ "net/http/pprof"
 	"os"
+	"runtime"
 	"runtime/pprof"
 	"sync"
 	"time"
@@ -15,107 +17,83 @@ import (
 // optimal buffer for now: 1000 << 10
 
 func main() {
-	// initPprof()
+	maxProcs := runtime.GOMAXPROCS(0)
+
+	startTime := time.Now()
 	f2, _ := os.Create("cpu.prof")
-	pprof.StartCPUProfile(f2)
+	_ = pprof.StartCPUProfile(f2)
 	defer pprof.StopCPUProfile()
 
 	f3, _ := os.Create("mem.prof")
-	pprof.WriteHeapProfile(f3)
+	_ = pprof.WriteHeapProfile(f3)
 
 	f, startTime := openMeasurements("measurements_1b.txt")
 
-	defer f.Close()
-	durationOpenFile := time.Since(startTime)
-
-	startProcessing := time.Now()
+	defer func() {
+		_ = f.Close()
+	}()
 
 	var wg sync.WaitGroup
-	shardChan := make(chan map[string]Station, 5)
-	chunkChan := make(chan []byte, 5)
+	shardChan := make(chan map[string]Station)
+	chunkChan := make(chan []byte, maxProcs*2)
 
-	for range 20 {
+	for range maxProcs {
 		wg.Add(1)
 		go processChunks(&wg, chunkChan, shardChan)
 	}
 
 	var wgMap sync.WaitGroup
 	wgMap.Add(1)
-
-	startMap := time.Now()
 	go mergeMaps(&wgMap, shardChan)
 
-	bufSize := 100 << 20 //100MB
-	startScan := time.Now()
-	var leftOver []byte
+	bufSize := 1 << 20 // 1MB
+	maxLine := 128
+	r := bufio.NewReaderSize(f, bufSize+maxLine)
 	for {
-		reserved := len(leftOver)
-		// make chunk that is big enough to hold next read
-		// and leftOver from previous read
-		chunk := make([]byte, 0, reserved+bufSize)
-		chunk = append(chunk, leftOver...)
-		chunk = chunk[:cap(chunk)]
+		chunk := make([]byte, bufSize+maxLine)
+		n, err := r.Read(chunk[:bufSize])
+		if n == 0 && err == io.EOF {
+			break
+		}
 
-		n, err := f.Read(chunk[reserved:])
-		var idxLinebreak int
-
-		// if chunk doesn't end in 'n'
-		lastNewElem := reserved + n - 1
-		if chunk[lastNewElem] != '\n' {
-			// walk bakwards until we find the first linebreak
-			for i := lastNewElem; i >= 0; i-- {
-				if chunk[i] == '\n' {
-					idxLinebreak = i
+		if chunk[n-1] != '\n' {
+			for {
+				nextByte, err := r.ReadByte()
+				if err != nil {
+					log.Fatal("couldn't proceed reading byte: %w", err)
+				}
+				n++
+				if nextByte == '\n' {
 					break
 				}
 			}
-			leftOver = chunk[idxLinebreak+1 : lastNewElem+1]
-			chunk = chunk[:idxLinebreak+1]
 		}
 
-		// chunk: [
-		// :reserved > leftovers from previours
-		// reserved+1:reserved+n-1 > new data read
-		// reserved+n-1:len(chunk) > potentially old unusable data
-		// ]
-		if n < bufSize {
-			// we need to cut off trailing space for our last chunk
-			chunk = chunk[:reserved+n-1]
-			chunkChan <- chunk
-			close(chunkChan)
-			continue
-		}
-
-		chunkChan <- chunk
+		chunkChan <- chunk[:n]
 		if err == io.EOF {
 			break
 		}
 	}
-
-	durationScan := time.Since(startScan)
+	close(chunkChan)
 
 	fmt.Println("waiting for processing...")
 	wg.Wait()
 	close(shardChan)
-	durationProcessing := time.Since(startProcessing)
 
 	fmt.Println("waiting for map...")
 	wgMap.Wait()
 
-	durationStartMap := time.Since(startMap)
-	durationAll := time.Since(startTime)
-
-	fmt.Printf("opening: %v, scan: %v, processing: %v, map: %v, all: %v\n", durationOpenFile, durationScan, durationProcessing, durationStartMap, durationAll)
+	fmt.Printf("took %v", time.Since(startTime))
 }
 
-func processChunks(wg *sync.WaitGroup, chunks chan []byte, shardCh chan map[string]Station) {
+func processChunks(wg *sync.WaitGroup, in chan []byte, out chan map[string]Station) {
 	defer wg.Done()
-	for chunk := range chunks {
+	shard := make(map[string]Station)
+	for chunk := range in {
 		var (
 			lineStart int
 			semicolon int
 		)
-		shard := make(map[string]Station)
 
 		for i, elem := range chunk {
 			if elem == ';' {
@@ -124,8 +102,7 @@ func processChunks(wg *sync.WaitGroup, chunks chan []byte, shardCh chan map[stri
 			}
 			// we found our float value, chunk[semicolon:i]
 			if elem == '\n' {
-				lineStart = i + 1
-				name := string(chunk[lineStart:i])
+				name := string(chunk[lineStart:semicolon])
 				value := processToFloat(chunk[semicolon+1 : i])
 				if station, ok := shard[name]; ok {
 					station.count++
@@ -139,11 +116,12 @@ func processChunks(wg *sync.WaitGroup, chunks chan []byte, shardCh chan map[stri
 				} else {
 					shard[name] = Station{minVal: value, sum: value, maxVal: value, count: 1}
 				}
+
+				lineStart = i + 1
 			}
 		}
-		shardCh <- shard
 	}
-
+	out <- shard
 }
 
 type Station struct {
