@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
-	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"sync"
 	"time"
 )
@@ -17,79 +17,118 @@ import (
 // optimal buffer for now: 1000 << 10
 
 func main() {
-	maxProcs := runtime.GOMAXPROCS(0)
+	f, err := os.Create("cpu.prof")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
 
-	startTime := time.Now()
-	f2, _ := os.Create("cpu.prof")
-	_ = pprof.StartCPUProfile(f2)
+	if err = pprof.StartCPUProfile(f); err != nil {
+		panic(err)
+	}
 	defer pprof.StopCPUProfile()
 
-	f3, _ := os.Create("mem.prof")
-	_ = pprof.WriteHeapProfile(f3)
+	startTime := time.Now()
+	run()
+	fmt.Printf("took %v", time.Since(startTime))
+}
 
-	f, startTime := openMeasurements("measurements_1b.txt")
+type Chunk struct {
+	ptr *[]byte
+	n   int
+}
 
-	defer func() {
-		_ = f.Close()
-	}()
+func run() {
+	bufSize := 2048 * 2048
+	maxLine := 128
 
-	var wg sync.WaitGroup
-	shardChan := make(chan map[string]Station)
-	chunkChan := make(chan []byte, maxProcs*2)
-
-	for range maxProcs {
-		wg.Add(1)
-		go processChunks(&wg, chunkChan, shardChan)
+	chunkPool := sync.Pool{
+		New: func() any {
+			c := make([]byte, bufSize+maxLine)
+			return &c
+		},
 	}
 
-	var wgMap sync.WaitGroup
-	wgMap.Add(1)
-	go mergeMaps(&wgMap, shardChan)
+	maxProcs := runtime.GOMAXPROCS(0)
+	fmt.Println("GOMAXPROCS:", maxProcs)
 
-	bufSize := 1 << 20 // 1MB
-	maxLine := 128
-	r := bufio.NewReaderSize(f, bufSize+maxLine)
+	f := openMeasurements("measurements_1b.txt")
+	defer f.Close()
+
+	// create workers to process chunks
+	var wg sync.WaitGroup
+	shardChan := make(chan map[string]*Station)
+	chunkChan := make(chan Chunk, maxProcs)
+	for range maxProcs {
+		wg.Add(1)
+		go processChunks(&wg, &chunkPool, chunkChan, shardChan)
+	}
+
+	// create single worker to merge shards from
+	// processing workers to global map result
+	mapChan := make(chan map[string]*Station)
+	go mergeMaps(shardChan, mapChan)
+	r := bufio.NewReaderSize(f, 2048*2048)
+
 	for {
-		chunk := make([]byte, bufSize+maxLine)
+		chunkPtr := chunkPool.Get().(*[]byte)
+		chunk := *chunkPtr
 		n, err := r.Read(chunk[:bufSize])
 		if n == 0 && err == io.EOF {
 			break
 		}
 
-		if chunk[n-1] != '\n' {
+		if n > 0 && chunk[n-1] != '\n' {
 			for {
 				nextByte, err := r.ReadByte()
 				if err != nil {
+					if err == io.EOF {
+						break
+					}
 					log.Fatal("couldn't proceed reading byte: %w", err)
 				}
+				chunk[n] = nextByte
 				n++
 				if nextByte == '\n' {
 					break
 				}
 			}
 		}
-
-		chunkChan <- chunk[:n]
-		if err == io.EOF {
-			break
-		}
+		chunkChan <- Chunk{ptr: chunkPtr, n: n}
 	}
 	close(chunkChan)
 
-	fmt.Println("waiting for processing...")
+	// wait for processing workers to finish working on chunks
 	wg.Wait()
 	close(shardChan)
 
-	fmt.Println("waiting for map...")
-	wgMap.Wait()
-
-	fmt.Printf("took %v", time.Since(startTime))
+	// sort map, calculate results
+	processOutput(mapChan)
 }
 
-func processChunks(wg *sync.WaitGroup, in chan []byte, out chan map[string]Station) {
+func processOutput(in chan map[string]*Station) {
+	global := <-in
+
+	keys := make([]string, len(global))
+	i := 0
+	for k := range global {
+		keys[i] = k
+		i++
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		localStation := global[key]
+		fmt.Printf("%s;%.1f;%.1f;%.1f\n", key, localStation.minVal, localStation.sum/localStation.count, localStation.maxVal)
+	}
+}
+
+func processChunks(wg *sync.WaitGroup, chunkPool *sync.Pool, in chan Chunk, out chan map[string]*Station) {
 	defer wg.Done()
-	shard := make(map[string]Station)
-	for chunk := range in {
+	shard := make(map[string]*Station)
+
+	for c := range in {
+		chunk := (*c.ptr)[:c.n]
 		var (
 			lineStart int
 			semicolon int
@@ -104,23 +143,27 @@ func processChunks(wg *sync.WaitGroup, in chan []byte, out chan map[string]Stati
 			if elem == '\n' {
 				name := string(chunk[lineStart:semicolon])
 				value := processToFloat(chunk[semicolon+1 : i])
-				if station, ok := shard[name]; ok {
-					station.count++
-					station.sum += value
-					if value < station.minVal {
-						station.minVal = value
-					} else if value > station.minVal {
-						station.maxVal = value
-					}
-					shard[name] = station
-				} else {
-					shard[name] = Station{minVal: value, sum: value, maxVal: value, count: 1}
-				}
-
 				lineStart = i + 1
+
+				station, ok := shard[name]
+				if !ok {
+					newStation := &Station{minVal: value, sum: value, maxVal: value, count: 1}
+					shard[name] = newStation
+					continue
+				}
+				station.count++
+				station.sum += value
+				if value < station.minVal {
+					station.minVal = value
+				} else if value > station.maxVal {
+					station.maxVal = value
+				}
 			}
 		}
+		*c.ptr = (*c.ptr)[:cap(*c.ptr)]
+		chunkPool.Put(c.ptr)
 	}
+
 	out <- shard
 }
 
@@ -131,11 +174,10 @@ type Station struct {
 	count  float64
 }
 
-func mergeMaps(wg *sync.WaitGroup, shardChan chan map[string]Station) {
-	defer wg.Done()
-	globalStations := make(map[string]Station)
+func mergeMaps(in chan map[string]*Station, out chan map[string]*Station) {
+	globalStations := make(map[string]*Station)
 
-	for shard := range shardChan {
+	for shard := range in {
 		for name, shardStation := range shard {
 			if globalStation, ok := globalStations[name]; ok {
 				globalStation.count++
@@ -151,16 +193,15 @@ func mergeMaps(wg *sync.WaitGroup, shardChan chan map[string]Station) {
 			}
 		}
 	}
-	fmt.Println(globalStations)
+	out <- globalStations
 }
 
-func openMeasurements(path string) (*os.File, time.Time) {
-	start := time.Now()
+func openMeasurements(path string) *os.File {
 	file, err := os.Open(path)
 	if err != nil {
 		log.Fatal("unable to open measurements, err: ", err)
 	}
-	return file, start
+	return file
 }
 
 func processToFloat(b []byte) float64 {
