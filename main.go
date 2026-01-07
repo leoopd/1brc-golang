@@ -13,8 +13,17 @@ import (
 	"time"
 )
 
-// max seems to be 1073741824B, ~1GB
-// optimal buffer for now: 1000 << 10
+type Chunk struct {
+	ptr *[]byte
+	n   int
+}
+
+type Station struct {
+	minVal int
+	sum    int
+	maxVal int
+	count  int
+}
 
 func main() {
 	f, err := os.Create("cpu.prof")
@@ -33,13 +42,8 @@ func main() {
 	fmt.Printf("took %v", time.Since(startTime))
 }
 
-type Chunk struct {
-	ptr *[]byte
-	n   int
-}
-
 func run() {
-	bufSize := 2048 * 2048
+	bufSize := 2048 * 2048 // 4MiB
 	maxLine := 128
 
 	chunkPool := sync.Pool{
@@ -106,21 +110,12 @@ func run() {
 	processOutput(mapChan)
 }
 
-func processOutput(in chan map[string]*Station) {
-	global := <-in
-
-	keys := make([]string, len(global))
-	i := 0
-	for k := range global {
-		keys[i] = k
-		i++
+func openMeasurements(path string) *os.File {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatal("unable to open measurements, err: ", err)
 	}
-	sort.Strings(keys)
-
-	for _, key := range keys {
-		localStation := global[key]
-		fmt.Printf("%s;%.1f;%.1f;%.1f\n", key, localStation.minVal, localStation.sum/localStation.count, localStation.maxVal)
-	}
+	return file
 }
 
 func processChunks(wg *sync.WaitGroup, chunkPool *sync.Pool, in chan Chunk, out chan map[string]*Station) {
@@ -142,7 +137,7 @@ func processChunks(wg *sync.WaitGroup, chunkPool *sync.Pool, in chan Chunk, out 
 			// we found our float value, chunk[semicolon:i]
 			if elem == '\n' {
 				name := string(chunk[lineStart:semicolon])
-				value := processToFloat(chunk[semicolon+1 : i])
+				value := processNum(chunk[semicolon+1 : i])
 				lineStart = i + 1
 
 				station, ok := shard[name]
@@ -163,15 +158,34 @@ func processChunks(wg *sync.WaitGroup, chunkPool *sync.Pool, in chan Chunk, out 
 		*c.ptr = (*c.ptr)[:cap(*c.ptr)]
 		chunkPool.Put(c.ptr)
 	}
-
 	out <- shard
 }
 
-type Station struct {
-	minVal float64
-	sum    float64
-	maxVal float64
-	count  float64
+func processNum(b []byte) int {
+	var (
+		tmp int
+		i   int
+		neg bool
+	)
+
+	if b[0] == '-' {
+		neg = true
+		i++
+	}
+
+	if b[i+1] == '.' {
+		tmp = int(b[i]-'0') * 10
+		tmp += int(b[i+2] - '0')
+	} else {
+		tmp = int(b[i]-'0') * 100
+		tmp += int(b[i+1]-'0') * 10
+		tmp += int(b[i+3] - '0')
+	}
+
+	if neg {
+		return -tmp
+	}
+	return tmp
 }
 
 func mergeMaps(in chan map[string]*Station, out chan map[string]*Station) {
@@ -196,36 +210,19 @@ func mergeMaps(in chan map[string]*Station, out chan map[string]*Station) {
 	out <- globalStations
 }
 
-func openMeasurements(path string) *os.File {
-	file, err := os.Open(path)
-	if err != nil {
-		log.Fatal("unable to open measurements, err: ", err)
-	}
-	return file
-}
+func processOutput(in chan map[string]*Station) {
+	global := <-in
 
-func processToFloat(b []byte) float64 {
-	neg := false
+	keys := make([]string, len(global))
 	i := 0
-
-	if b[0] == '-' {
-		neg = true
+	for k := range global {
+		keys[i] = k
 		i++
 	}
+	sort.Strings(keys)
 
-	intPart := b[i] - '0'
-	decimal := b[len(b)-1] - '0'
-	i++
-
-	for ; i < len(b); i++ {
-		if b[i] == '.' {
-			break
-		}
-		intPart += (b[i] - '0') * 10
+	for _, key := range keys {
+		localStation := global[key]
+		fmt.Printf("%s;%.1f;%.1f;%.1f\n", key, float64(localStation.minVal)/10, float64(localStation.sum)/10/float64(localStation.count), float64(localStation.maxVal)/10)
 	}
-
-	if neg {
-		return -(float64(intPart) + float64(decimal)/10)
-	}
-	return float64(intPart) + float64(decimal)/10
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"bytes"
 	"os"
 	"path/filepath"
@@ -120,3 +121,36 @@ Paris;8.0
 		t.Fatalf("unexpected output for London:\n%s", output)
 	}
 }
+
+func Test_processToFloat(t *testing.T) {
+	tests := []struct {
+		name string // description of this test case
+		// Named input parameters for target function.
+		b    []byte
+		want int
+	}{
+		// TODO: Add test cases.
+		{
+			name: "base test",
+			b: []byte{'2','2','.','9'},
+			want: 229,
+		},
+		{
+			name: "neg test",
+			b: []byte{'-','2','2','.','9'},
+			want: -229,
+		},
+		
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := processNum(tt.b)
+			// TODO: update the condition below to compare got with tt.want.
+			fmt.Printf("got: %d, want: %d\n", got, tt.want)
+			if got != tt.want {
+				t.Errorf("processToFloat() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
